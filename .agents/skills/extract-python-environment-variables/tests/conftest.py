@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Make this skill's scripts/ directory importable from its tests.
 
-from dotenv import load_dotenv
+Keeping the path shim inside the skill (rather than in the repo-root pytest
+config) preserves the skill as a self-contained, portable bundle.
+"""
 
-# Load variables from .env if present. In production the environment is
-# already populated by the platform (Cloud Run, GKE, etc.), so a missing
-# .env is expected and not an error.
-load_dotenv()
+import sys
+from pathlib import Path
 
-from .agent import app  # noqa: E402 -- must come after load_dotenv()
-
-__all__ = ["app"]
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))

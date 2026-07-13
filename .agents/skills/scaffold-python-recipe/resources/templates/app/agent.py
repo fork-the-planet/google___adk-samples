@@ -14,14 +14,10 @@
 
 import os
 
-from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.apps import App
 from google.adk.models import Gemini
 from google.genai import types
-
-# Load the .env file
-load_dotenv()
 
 
 def get_weather(query: str) -> str:
@@ -44,7 +40,7 @@ def create_agent() -> Agent:
     return Agent(
         name="root_agent",
         model=Gemini(
-            model=os.getenv("MODEL_NAME", "gemini-3.5-flash"),
+            model=os.getenv("MODEL_NAME"),
             retry_options=types.HttpRetryOptions(attempts=3),
         ),
         instruction=(
