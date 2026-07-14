@@ -20,8 +20,29 @@ Scans a Python recipe directory and:
   2. Creates or updates .env.example with any missing variables.
   3. Injects the load_dotenv() bootstrap snippet into the package __init__.py.
   4. Ensures python-dotenv>=1.0.0 is listed in pyproject.toml dependencies.
-  5. Detects hardcoded model name strings, replaces them with
-     os.getenv("MODEL_NAME"), and adds MODEL_NAME to .env.example.
+  5. Detects hardcoded model name strings and replaces them with
+     bare os.getenv("MODEL_NAME") calls (no default argument).
+
+Two hard rules the script NEVER breaks:
+
+  (1) NO INFERRED DEFAULTS ANYWHERE. Every new .env.example entry is
+      written with the TODO placeholder as its value, regardless of any
+      `os.getenv("VAR", "some_default")` fallback the source code may
+      have. The model-replacement path likewise emits bare
+      os.getenv("MODEL_NAME") — no second argument, even though the
+      original hardcoded model string is known.
+
+  (2) ADDITIVE-ONLY FOR PYTHON FILES. The script never writes new
+      os.environ.setdefault(...) bootstrap lines into any Python file.
+      Pre-existing os.environ.setdefault(...) or
+      os.getenv("VAR", "default") calls that a recipe author wrote by
+      hand are LEFT UNTOUCHED — the script's only writes to Python
+      files are (a) the load_dotenv snippet and (b) the model-literal
+      replacement.
+
+Rationale: default values are the maintainer's decision, not the
+script's. Persisting inferred defaults or writing new bootstrap
+setdefault() calls would be presumptuous.
 """
 
 import argparse
@@ -260,8 +281,12 @@ def update_env_example(
         " extract-python-environment-variables\n"
     )
     for var in sorted(to_add):
-        value = to_add[var] if to_add[var] is not None else PLACEHOLDER
-        block += f"{var}={value}\n"
+        # Deliberately do NOT write extracted defaults from source code into
+        # .env.example. .env.example is a template the human maintainer fills
+        # in, not a place to smuggle inferred defaults. Every value written
+        # here is the PLACEHOLDER, regardless of whether the source code has
+        # an `os.getenv("VAR", "some_default")` fallback.
+        block += f"{var}={PLACEHOLDER}\n"
 
     env_example.write_text(current + block, encoding="utf-8")
     return sorted(to_add.keys())
@@ -780,6 +805,13 @@ def _model_replacement(
         return None
     start = _flat_offset(lines, node.lineno, node.col_offset)
     end = _flat_offset(lines, node.end_lineno, node.end_col_offset)
+    # Emit BARE `os.getenv("VAR")` — no default argument. This is a hard
+    # rule of the skill: we do NOT write inferred defaults into Python
+    # source, even though `os.getenv("MODEL_NAME", node.value)` would be
+    # trivially "safer" (the recipe would keep working after the rewrite
+    # even without .env set up). Default values are the maintainer's
+    # decision; the skill's job is to lift the constant out of the source,
+    # not to also decide what fallback the maintainer wants.
     return start, end, f'os.getenv("{var_name}")', node.value, var_name
 
 
@@ -987,9 +1019,16 @@ def run_step_model_names(
     if added_models:
         add_verb = "Would add" if dry_run else "Added"
         for var in added_models:
+            # The `.env.example` line is written with PLACEHOLDER as the value
+            # (see update_env_example — this skill NEVER writes inferred
+            # defaults into .env.example, even when replacing a hardcoded
+            # value). We surface the original hardcoded string here in the
+            # log ONLY so the maintainer knows what value to fill in — the
+            # string is NOT persisted in .env.example.
             print(
-                f"[{_tag(dry_run)}] {add_verb} {var}={vars_to_add[var]} "
-                "to .env.example."
+                f"[{_tag(dry_run)}] {add_verb} {var} to .env.example "
+                f"with placeholder value (the replaced hardcoded value was "
+                f'"{vars_to_add[var]}" — fill it in manually).'
             )
     else:
         print("[PASS] All MODEL_NAME_* vars already in .env.example — skipped.")
