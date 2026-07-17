@@ -14,9 +14,9 @@ description: >
   renamed if needed). Delegates to the existing sub-skills
   (generate-manifest, extract-python-environment-variables,
   align-recipe-pyproject, generate-python-runnability-test) so the master
-  never duplicates their logic. Pauses at fixed decision points (manifest
-  team/POC verification, description mismatch, existing test regeneration)
-  AND is free to interrupt for clarification any time a phase's output
+  never duplicates their logic. Pauses at fixed decision points
+  (description mismatch, existing test regeneration) AND is free to
+  interrupt for clarification any time a phase's output
   looks ambiguous, unexpected, or would benefit from a human judgment
   call — this is an interactive skill by design. Use when the user wants
   to "prepare a recipe", "update a recipe end to end", "run all the
@@ -31,7 +31,20 @@ metadata:
 
 Master orchestration skill. Runs the other Python-recipe skills in the right order, with the right inputs, in a single pipeline. Use when the user wants a recipe brought fully up to standard in one go.
 
-**This is an interactive skill.** It's expected to pause and ask questions when doing so genuinely improves the outcome — not just at the four fixed checkpoints below, but any time a phase's output is ambiguous, surprising, or would benefit from a judgment call. See rule 5 (fixed checkpoints) and rule 6 (judgment-based interruptions) for the difference.
+**This is an interactive skill.** It's expected to pause and ask questions when doing so genuinely improves the outcome — not just at the fixed checkpoints below, but any time a phase's output is ambiguous, surprising, or would benefit from a judgment call. See rule 5 (fixed checkpoints) and rule 6 (judgment-based interruptions) for the difference.
+
+---
+
+## Canonical placeholder strings
+
+Two ownership placeholders are written by `generate-manifest` and enforced by `tools/validate_manifest.py`. They must be the EXACT strings below — never invent, translate, or rephrase them:
+
+```
+OWNERSHIP_TEAM_PLACEHOLDER = "TODO: Replace with your team name"
+OWNERSHIP_POC_PLACEHOLDER  = "TODO: Replace with your GitHub user ID"
+```
+
+`generate-manifest` is the single source of truth for these values. This skill NEVER replaces them mid-pipeline — they are intentionally left in place so CI validation fails until a human fills them in. Replacing them lives in the user's post-pipeline TODO list (see the summary's "What you still need to do" section).
 
 ---
 
@@ -53,7 +66,7 @@ If the user has NOT done these and asks you to run the skill anyway, tell them t
 
 Runs seven ordered phases against a target recipe. Each phase either invokes an existing sub-skill (or its underlying script) or runs a repo-standard command:
 
-1. **Manifest** — generate `manifest.yaml` if missing; ask the user to verify `ownership.team` and `ownership.poc`.
+1. **Manifest** — generate `manifest.yaml` if missing. Ownership placeholders (`ownership.team`, `ownership.poc`) are LEFT AS-IS — never replaced mid-pipeline. See "Canonical placeholder strings" above.
 2. **Environment variables** — extract env vars used by the recipe into `.env.example`; ensure `load_dotenv()` is bootstrapped and `python-dotenv` is a dep.
 3. **Align pyproject.toml** — remove `[tool.ruff*]`, raise `requires-python` floor, ensure `[project].name` matches folder, reconcile description with manifest, and ensure `[[tool.uv.index]]` declares public PyPI as default (needed to bypass corp Airlock).
 4. **Lint** — `ruff format` + `ruff check --fix` on the recipe (from the repo root, so the root ruff config wins). **Must run AFTER Phase 3** — align removes any recipe-local `[tool.ruff*]` block, and that removal is what makes the root config the effective one. Running lint before align would check against the recipe's (often more permissive) local config and miss violations that CI will later catch.
@@ -76,7 +89,6 @@ At the end, print a summary table and remind the user to `git diff` and commit �
 4. **Exception for pure-instructions skills**: `generate-manifest` has no script — it's a pure-instructions skill. For that one only, load its SKILL.md (via the `skill` tool) and follow it inline.
 
 5. **Fixed checkpoints — always pause here**:
-   - **Manifest team/POC verification** — after Phase 1, `manifest.yaml` will contain the placeholders `"TODO: Replace with your team name"` and `"TODO: Replace with your GitHub user ID"`. Show them and ask for real values. (These exact strings are the canonical placeholders that `generate-manifest` writes AND that `tools/validate_manifest.py` enforces in CI — the three must stay in sync; if the validator's strings ever change, update this checkpoint, Phase 1c, and generate-manifest together.)
    - **Description mismatch** — if Phase 3 returns `needs_input` for `description-matches-manifest`, show both sides and ask the user to pick `pyproject`, `manifest`, or `delete`.
    - **Test file exists** — before Phase 6, if `tests/test_runnability.py` already exists, ask whether to regenerate (default: keep existing). Regeneration uses `--overwrite`.
    - **Entry point not found (Phase 6)** — if the runnability-test generator errors because no `agent.py` was found, surface the message and offer to re-run with `--agent-file <path>` once the user says where the entry point is. This is the one `error` case with a defined recovery instead of a hard stop.
@@ -122,7 +134,7 @@ If the user has not specified the recipe directory, ask for it before proceeding
 
 ### Phase 0 — plan + confirm (do this first, always)
 
-**First, verify the recipe directory actually exists** — a path typo shouldn't cost the user the whole plan-confirmation round-trip only to fail in Phase 1:
+**Step 0a — Verify the recipe directory actually exists.** A path typo shouldn't cost the user the whole plan-confirmation round-trip only to fail in Phase 1:
 
 ```bash
 [ -d <RECIPE_DIR> ] || { echo "Recipe directory not found: <RECIPE_DIR>"; exit 1; }
@@ -130,15 +142,29 @@ If the user has not specified the recipe directory, ask for it before proceeding
 
 If it isn't a directory, stop immediately with that message — do NOT show the plan or prompt.
 
-Then, before running anything, quickly confirm the prerequisites and show the user the plan:
+**Step 0b — Verify the recipe folder name matches CI's naming rules.** `python-validate-recipe.yml`'s Check 1 (folder-name regex + max length) rejects folders that don't match `^[a-z][a-z-]*$` or exceed `.github/policy.yml` `recipe_naming.max_folder_name_length`. Historically the pipeline was BLIND to this — it would run all 7 phases against a folder named `data_science` or `MyBadName`, report success, and let CI reject the PR later (or worse: Phase 3's `project-name-matches-folder` would propagate the bad name into `[project].name`). This check catches it up front.
 
-> Prerequisites (I'll assume these are done — tell me if not):
+```bash
+MAX_LEN=$(uv run --no-project --with pyyaml python3 .github/scripts/load_policy.py recipe_naming.max_folder_name_length)
+uv run --no-project python3 .agents/skills/prepare-python-recipe/scripts/check_folder_name.py \
+  --recipe-dir <RECIPE_DIR> --max-length "$MAX_LEN"
+```
+
+The check exits 0 silently on a compliant name; on violation it exits 1 with the specific offending characters, the length overrun (if any), and a suggested compliant name derived from the current one (lowercase, `_` → `-`, drop disallowed characters, truncate on a hyphen boundary). The suggestion is ADVISORY — the script never renames anything.
+
+**If it fails, HALT the pipeline before Phase 1.** Print the script's stderr verbatim (it already includes the suggestion and the manual `git mv` command). Do NOT show the plan, do NOT prompt to proceed, do NOT ask "want me to rename?" — renaming a recipe directory is the user's decision, not the skill's. They rename by hand and re-invoke the skill.
+
+**Only proceed past this step if the folder-name check passed.**
+
+**Step 0c — Show the plan and get confirmation.** Before running anything, briefly flag the assumptions the pipeline is making and show the user the plan. Do NOT frame these as "prerequisites" — they're a heads-up so the user can push back if any assumption is wrong, not a preflight checklist for the user to tick off:
+
+> A few things I'm assuming — say so if any aren't true:
 >   - You've deactivated any active venv.
 >   - You've run `git pull` and `uv sync` at the repo root.
 >   - `<RECIPE_DIR>` is already at its target path (and renamed to its final basename).
 >
 > I'll run the prepare-python-recipe pipeline on `<RECIPE_DIR>` — 7 phases:
-> 1. Generate manifest.yaml (if missing; verify team + POC)
+> 1. Generate manifest.yaml (if missing)
 > 2. Extract env vars into .env.example
 > 3. Align pyproject.toml
 > 4. Ruff format + check --fix
@@ -158,13 +184,11 @@ Get a yes-or-no. If no, stop.
 [ -f <RECIPE_DIR>/manifest.yaml ] && echo exists || echo missing
 ```
 
-**1b. If missing** — load the `generate-manifest` skill (via the `skill` tool with `name="generate-manifest"`) and follow its instructions for this recipe. That skill writes `manifest.yaml` with placeholders for team/POC.
+**1b. If missing** — load the `generate-manifest` skill (via the `skill` tool with `name="generate-manifest"`) and follow its instructions for this recipe. That skill writes `manifest.yaml` with the canonical ownership placeholders — LEAVE THEM AS-IS.
 
-**1b. If exists** — skip generation. Note it in the summary.
+**1b. If exists** — skip generation. Do NOT read `ownership.team` / `ownership.poc` and do NOT prompt about them. Whatever they are (real values or the canonical placeholders), leave them untouched — the user handles ownership post-pipeline.
 
-**1c. Verify team/POC** — regardless of whether we generated fresh or the file already existed, read `manifest.yaml` and locate `ownership.team` and `ownership.poc`. If either equals a placeholder value (`"TODO: Replace with your team name"` or `"TODO: Replace with your GitHub user ID"`), pause and ask the user for real values. When they answer, edit `manifest.yaml` in place (use the `edit` tool). If both are already filled in, do not ask.
-
-Progress line: `Phase 1 (manifest): generated | pre-existing; team=<x>, poc=<y>.`
+Progress line: `Phase 1 (manifest): generated | pre-existing.`
 
 ### Phase 2 — extract env vars
 
@@ -230,6 +254,8 @@ uv run ruff check --fix <RECIPE_DIR>
 - **Exit 1** — genuine violations ruff can't auto-fix (typically `C901` complex-structure, `PLR0912/0915` too-many-branches/statements). Do NOT stop the pipeline — note them in the summary as a Manual TODO so the user can refactor or add per-file `# noqa` markers after review.
 - **Exit 2** — ruff itself errored (invalid config, a file-system problem, or a bug in ruff), NOT a violation count. Phase 4 effectively did not run, so treat this as a hard error under rule 7: stop the pipeline and surface the message. Do not mistake it for "violations remain" and continue.
 
+Note on `E402` and `__init__.py`: Phase 2 (env-var extraction) already suppresses `E402` on any trailing relative import (`from . import agent`) in the recipe's package `__init__.py` — the canonical ADK-recipe pattern where env-bootstrap side effects (`load_dotenv()`, `os.environ.setdefault(...)`) intentionally precede a `from . import ...` line so env vars are populated before agent submodules load. If you see `E402` on an `__init__.py` in Phase 4's output, something went wrong upstream (Phase 2 didn't detect the pattern, or a new file appeared between Phases 2 and 4). Note that in the progress line so it isn't quietly buried.
+
 Progress line: `Phase 4 (lint): <N> file(s) formatted, <M> issue(s) auto-fixed, <K> unfixable issue(s) left.`
 
 ### Phase 5 — recipe `uv lock`
@@ -237,10 +263,12 @@ Progress line: `Phase 4 (lint): <N> file(s) formatted, <M> issue(s) auto-fixed, 
 Now that `pyproject.toml` is stable (Phase 3 aligned it, Phase 4 didn't touch it), regenerate the lockfile so it matches:
 
 ```bash
-uv lock
+uv lock --python 3.11
 ```
 
 Run this WITH `workdir = <RECIPE_DIR>` (do not `cd` — pass the working directory via the tool call).
+
+**Why `--python 3.11` explicitly?** CI's `.github/workflows/python-dependency-policy.yml` pins Python 3.11 when it runs `uv lock --check` on every recipe. If we lock here with whatever interpreter the user happens to have installed (typically 3.12 or newer on modern machines), the recipe locks cleanly locally but the CI check fails on the PR with a confusing `The requested interpreter resolved to Python 3.11.15, which is incompatible with the project's Python requirement: >=3.12` — mis-reported by the workflow as "lockfile is out of date". Forcing 3.11 here surfaces the same incompatibility at pipeline time, when the user can fix it or push back, rather than at PR time. Phase 3's `python-version-floor` check should have already caught this and rewritten `requires-python`, so the lock should succeed — but pinning defends against edge cases where the check was too permissive or the recipe had a compatible-release ceiling the rewrite couldn't lower.
 
 **Why `uv lock` and not `uv sync`?** The pipeline's job is to prepare the recipe, not to install and validate its runtime environment. `uv lock` resolves dependencies against the aligned `pyproject.toml` and writes `uv.lock` — that's the artefact CI and downstream consumers need. `uv sync` would additionally download every wheel into `.venv/`, which:
 - Is slow (minutes of network I/O).
@@ -249,9 +277,9 @@ Run this WITH `workdir = <RECIPE_DIR>` (do not `cd` — pass the working directo
 
 The user gets a real `.venv/` by running `uv sync` themselves after reviewing the diff — see the "Next steps" block at the end of the summary.
 
-If `uv lock` fails (dependency conflict, unresolvable version, invalid `pyproject.toml`), stop and surface the error.
+If `uv lock --python 3.11` fails, halt and surface the error verbatim (rule 7). The most common cause is a `requires-python` specifier that excludes 3.11 (`>=3.12`, `~=3.12`, etc.) that Phase 3 could not rewrite — the fix is to either lower the recipe's floor to `>=3.11` or, if the recipe genuinely needs newer features, raise the issue with the repo maintainers to update CI's pinned interpreter.
 
-Progress line: `Phase 5 (recipe lock): uv lock completed.`
+Progress line: `Phase 5 (recipe lock): uv lock --python 3.11 completed.`
 
 ### Phase 6 — runnability test
 
@@ -318,7 +346,7 @@ At the end, print the sections below in order. Section 3 is **conditional** — 
 
 | Phase | Outcome | Notes |
 |---|---|---|
-| 1. Manifest | ok | generated; team=<x>, poc=<y> |
+| 1. Manifest | ok | generated (ownership placeholders left for user to fill in) |
 | 2. Env vars | ok | 3 added, load_dotenv injected, python-dotenv added |
 | 3. Align | ok | 2 fixes applied |
 | 4. Lint | ok | 12 files formatted, 4 issues auto-fixed |
@@ -369,7 +397,7 @@ A single short TODO list. Keep every entry to one line. Standard items come firs
 
 **Standard — always include (skip only if genuinely N/A):**
 
-1. **Verify manifest** — open `<RECIPE_DIR>/manifest.yaml` and confirm `ownership.team` and `ownership.poc` are correct. Omit this item if the user supplied real values at the Phase 1c prompt during this run — they just confirmed them, so re-listing it is noise. Keep it when the manifest pre-existed with values the pipeline never asked the user about.
+1. **Fill in ownership** — open `<RECIPE_DIR>/manifest.yaml` and replace `ownership.team` (`"TODO: Replace with your team name"`) and `ownership.poc` (`"TODO: Replace with your GitHub user ID"`) with real values. CI validation intentionally fails until you do. If the manifest pre-existed and already had real values, this is a no-op — glance to confirm.
 2. **Fill in `.env.example`** — replace each `<TODO: ...>` placeholder with the real value (or delete the line if the variable isn't used).
 3. **Review the diff** — `cd <RECIPE_DIR> && git diff` — inspect every change the pipeline made before committing.
 
